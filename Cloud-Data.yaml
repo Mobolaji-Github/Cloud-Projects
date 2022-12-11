@@ -1,0 +1,1604 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SAVA STACK
+
+Resources:
+# BUCKET USED FOR SAVA PICS
+  # SavaBucket:
+  #   Type: AWS::S3::Bucket
+  #   # DependsOn: 
+  #   #   - ProcessingLambdaPermission
+  #   Properties:
+  #     BucketName: sava-users-bucket-mains
+  #     # NotificationConfiguration:
+  #     #   LambdaConfigurations:
+  #     #     - Event: s3:ObjectCreated:*
+  #     #       Function: !GetAtt 'ProcessingLambdaFunction.Arn'
+  #     #       Filter:
+  #     #         S3Key:
+  #     #           Rules:
+  #     #           - Name: suffix
+  #     #             Value: jpg
+
+
+# SAVA USERPOOL
+  SavaUserPool:
+    Type: 'AWS::Cognito::UserPool'
+    Properties:
+      UserPoolName: Sava
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: "OFF"
+      AutoVerifiedAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  # SAVA UserPoolClient
+  SavaUserPoolClient:
+    Type: 'AWS::Cognito::UserPoolClient'
+    Properties:
+      UserPoolId: !Ref SavaUserPool
+      ClientName: sava-app-client
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+      CallbackURLs:
+        - https://www.example.com/sign-in
+      LogoutURLs:
+        - https://www.example.com/sign-out
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email 
+        - openid
+  SavaDynamodb:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: sava-user-table
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: email
+          KeyType: RANGE
+      TableClass: STANDARD
+      BillingMode: PAY_PER_REQUEST
+  
+  # ROLES ASSUMED BY SAVA LAMBDAS
+  SavaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Description: String
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess      
+        - arn:aws:iam::aws:policy/AmazonCognitoPowerUser      
+        - arn:aws:iam::aws:policy/AmazonESCognitoAccess      
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess  
+      RoleName: savarole
+  
+  # SAVA SIGNUP
+  SavaSignup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: savasignUp 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import botocore.exceptions
+          import os
+          import hmac
+          import hashlib
+          import base64
+          import time
+
+          POOL_ID = os.environ['POOL_ID']
+          APP_CLIENT_ID = os.environ['APP_CLIENT_ID']
+          APP_CLIENT_SECRET = os.environ['APP_CLIENT_SECRET']
+          TABLENAME = os.environ['TABLENAME']
+
+          def secret_hash(user_email):
+              key = str(APP_CLIENT_SECRET).encode("utf-8")
+              message = str(user_email + APP_CLIENT_ID).encode("utf-8")
+              hash = base64.b64encode(
+                  hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+              return hash
+
+          def db_user_info(dynamodb, event, user_id):
+              table = dynamodb.Table(TABLENAME)
+              creation_date = str(time.ctime())
+              table.put_item(
+                  Item={
+                      'user_id': user_id,
+                      'email': event["email"],
+                      'created': creation_date
+                  }
+              )
+
+          def http_status_codes(code, response):
+              return {
+                  'statusCode': code,
+                  'response': response
+              }
+
+          def lambda_handler(event, context):
+              event = event['body'] if "body" in event and event['body'] is not None else event
+              for field in ["email", "password"]:
+                  if not event.get(field):
+                      response = f"Kindly select {field}"
+                      return http_status_codes(400, response)
+
+              client = boto3.client('cognito-idp')
+              user_email = event['email']
+              password = event['password']
+
+              try:
+                  response = client.sign_up(
+                      ClientId=APP_CLIENT_ID,
+                      SecretHash=secret_hash(user_email),
+                      Username=user_email,
+                      Password=password,
+                      UserAttributes=[
+                          {
+                              'Name': 'email',
+                              'Value': user_email
+                          }
+                      ],
+                      ValidationData=[
+                          {
+                              'Name': 'email',
+                              'Value': user_email
+                          }
+                      ]
+                  )
+
+                  user_info = client.admin_get_user(
+                      UserPoolId=POOL_ID,
+                      Username=user_email
+                  )
+                  print(response)
+                  user_data = {attr.get('Name'): attr.get('Value')
+                              for attr in user_info["UserAttributes"]}
+                  print(user_data)
+                  user_id = user_data['sub']
+                  dynamodb = boto3.resource('dynamodb')
+                  db_user_info(dynamodb, event, user_id)
+
+              except client.exceptions.ResourceNotFoundException as e:
+                  return http_status_codes(400, "Resource Not Found")
+              except client.exceptions.InvalidParameterException as e:
+                  return http_status_codes(400, "Invalid Parameter")
+              except client.exceptions.UnexpectedLambdaException as e:
+                  return http_status_codes(400, "Unexpected Lambda")
+              except client.exceptions.UserLambdaValidationException as e:
+                  return http_status_codes(400, "User Lambda Validation")
+              except client.exceptions.NotAuthorizedException as e:
+                  return http_status_codes(400, "Not Authorized")
+              except client.exceptions.InvalidPasswordException as e:
+                  return http_status_codes(400, "Invalid Password")
+              except client.exceptions.InvalidLambdaResponseException as e:
+                  return http_status_codes(400, "Invalid Lambda Response")
+              except client.exceptions.UsernameExistsException as e:
+                  return http_status_codes(400, "Username Exists")
+              except client.exceptions.TooManyRequestsException as e:
+                  return http_status_codes(400, "Too Many Requests")
+              except client.exceptions.InternalErrorException as e:
+                  return http_status_codes(400, "Internal Error")
+              except client.exceptions.InvalidSmsRoleAccessPolicyException as e:
+                  return http_status_codes(400, "Invalid Sms Role Access Policy")
+              except client.exceptions.InvalidSmsRoleTrustRelationshipException as e:
+                  return http_status_codes(400, "Invalid Sms Role Trust Relationship")
+              except client.exceptions.InvalidEmailRoleAccessPolicyException as e:
+                  return http_status_codes(400, "Invalid Email Role Access Policy")
+              except client.exceptions.CodeDeliveryFailureException as e:
+                  return http_status_codes(400, "Code Delivery Failure")
+              except client.exceptions.ForbiddenException as e:
+                  return http_status_codes(400, "Forbidden")
+      Environment:
+        Variables: 
+          POOL_ID: !Ref SavaUserPool
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+          TABLENAME: !Ref  SavaDynamodb
+
+   # SAVA COMFIRMSIGNUP
+  SavaConfirmSignup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: sava_confirm_signUp 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+            import json
+            import boto3
+            import botocore.exceptions
+            import os
+            import hmac
+            import hashlib
+            import base64
+            
+            POOL_ID = os.environ['POOL_ID']
+            APP_CLIENT_ID = os.environ['APP_CLIENT_ID']
+            APP_CLIENT_SECRET = os.environ['APP_CLIENT_SECRET']
+            
+            def secret_hash(user_email):
+                key = str(APP_CLIENT_SECRET).encode("utf-8")
+                message = str(user_email + APP_CLIENT_ID).encode("utf-8")
+                hash = base64.b64encode(
+                    hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+                return hash
+            
+            def http_status_codes(code, response):
+                return {
+                    'statusCode': code,
+                    'response': response
+                }
+            
+            def lambda_handler(event, context):
+                event = event['body'] if "body" in event and event['body'] is not None else event
+                for field in ["email", "confirmation code"]:
+                    if not event.get(field):
+                        response = f"Kindly select {field}"
+                        return http_status_codes(400, response)
+            
+                client = boto3.client('cognito-idp')
+                user_email = event['email']
+                confirmationcode = event['confirmation code']
+            
+                try:
+                    response = client.confirm_sign_up(
+                        ClientId=APP_CLIENT_ID,
+                        SecretHash=secret_hash(user_email),
+                        Username=user_email,
+                        ConfirmationCode=confirmationcode,
+                        ForceAliasCreation=False,
+                    )
+            
+                except client.exceptions.ResourceNotFoundException as e:
+                    return http_status_codes(400, "Resource Not Found")
+                except client.exceptions.InvalidParameterException as e:
+                    return http_status_codes(400, "Invalid Parameter")
+                except client.exceptions.UnexpectedLambdaException as e:
+                    return http_status_codes(400, "Unexpected Lambda")
+                except client.exceptions.UserLambdaValidationException as e:
+                    return http_status_codes(400, "User Lambda Validation")
+                except client.exceptions.NotAuthorizedException as e:
+                    return http_status_codes(400, "Not Authorized")
+                except client.exceptions.TooManyFailedAttemptsException as e:
+                    return http_status_codes(400, "Too Many Failed Attempts")
+                except client.exceptions.CodeMismatchException as e:
+                    return http_status_codes(400, "Code Mismatch")
+                except client.exceptions.ExpiredCodeException as e:
+                    return http_status_codes(400, "Expired Code")
+                except client.exceptions.InvalidLambdaResponseException as e:
+                    return http_status_codes(400, "Invalid Lambda Response")
+                except client.exceptions.AliasExistsException as e:
+                    return http_status_codes(400, "Alias Exists")
+                except client.exceptions.TooManyRequestsException as e:
+                    return http_status_codes(400, "Too Many Requests")
+                except client.exceptions.LimitExceededException as e:
+                    return http_status_codes(400, "Limit Exceeded")
+                except client.exceptions.UserNotFoundException as e:
+                    return http_status_codes(400, "User Not Found")
+                except client.exceptions.InternalErrorException as e:
+                    return http_status_codes(400, "Internal Error")
+                except client.exceptions.ForbiddenException as e:
+                    return http_status_codes(400, "Forbidden")
+
+      Environment:
+        Variables: 
+          POOL_ID: !Ref SavaUserPool
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+          # BUCKET: !Ref SavaBucket
+
+   # SAVA FORGOTPASSWORD
+  SavaForgotPassword:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: SavaForgotPassword 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import botocore.exceptions
+          import os
+          import hmac
+          import hashlib
+          import base64
+
+          POOL_ID = os.environ['POOL_ID']
+          APP_CLIENT_ID = os.environ['APP_CLIENT_ID']
+          APP_CLIENT_SECRET = os.environ['APP_CLIENT_SECRET']
+
+          def secret_hash(user_email):
+              key = str(APP_CLIENT_SECRET).encode("utf-8")
+              message = str(user_email + APP_CLIENT_ID).encode("utf-8")
+              hash = base64.b64encode(
+                  hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+              return hash
+
+          def http_status_codes(code, response):
+              return {
+                  'statusCode': code,
+                  'response': response
+              }
+
+          def lambda_handler(event, context):
+              event = event['body'] if "body" in event and event['body'] is not None else event
+              for field in ["email"]:
+                  if not event.get(field):
+                      response = f"Kindly select {field}"
+                      return http_status_codes(400, response)
+
+              client = boto3.client('cognito-idp')
+              user_email = event['email']
+              
+              try:
+                  response = client.forgot_password(
+                      ClientId=APP_CLIENT_ID,
+                      SecretHash=secret_hash(user_email),
+                      Username=user_email
+                  )
+
+              except client.exceptions.ResourceNotFoundException as e:
+                  return http_status_codes(400, "Resource Not Found")
+              except client.exceptions.InvalidParameterException as e:
+                  return http_status_codes(400, "Invalid Parameter")
+              except client.exceptions.UnexpectedLambdaException as e:
+                  return http_status_codes(400, "Unexpected Lambda")
+              except client.exceptions.UserLambdaValidationException as e:
+                  return http_status_codes(400, "User Lambda Validation")
+              except client.exceptions.NotAuthorizedException as e:
+                  return http_status_codes(400, "Not Authorized")
+              except client.exceptions.InvalidLambdaResponseException as e:
+                  return http_status_codes(400, "Invalid Lambda Response")
+              except client.exceptions.TooManyRequestsException as e:
+                  return http_status_codes(400, "Too Many Requests")
+              except client.exceptions.LimitExceededException as e:
+                  return http_status_codes(400, "Limit Exceeded")
+              except client.exceptions.InvalidSmsRoleAccessPolicyException as e:
+                  return http_status_codes(400, "Invalid Sms RoleAccess Policy")
+              except client.exceptions.InvalidSmsRoleTrustRelationshipException as e:
+                  return http_status_codes(400, "InvalidSmsRoleTrustRelationship")
+              except client.exceptions.InvalidEmailRoleAccessPolicyException as e:
+                  return http_status_codes(400, "InvalidEmailRoleAccessPolicy")
+              except client.exceptions.CodeDeliveryFailureException as e:
+                  return http_status_codes(400, "Code Delivery Failure")
+              except client.exceptions.UserNotFoundException as e:
+                  return http_status_codes(400, "User Not Found")
+              except client.exceptions.InternalErrorException as e:
+                  return http_status_codes(400, "Internal Error")
+              except client.exceptions.ForbiddenException as e:
+                  return http_status_codes(400, "Forbidden")
+      Environment:
+        Variables: 
+          POOL_ID: !Ref SavaUserPool
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+
+   # SAVA CONFIRMFORGOTPASSWORD         
+  SavaConfirmForgotPassword:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: SavaConfirmForgotPassword 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+            import json
+            import boto3
+            import botocore.exceptions
+            import os
+            import hmac
+            import hashlib
+            import base64
+
+            POOL_ID = os.environ['POOL_ID']
+            APP_CLIENT_ID = os.environ['APP_CLIENT_ID']
+            APP_CLIENT_SECRET = os.environ['APP_CLIENT_SECRET']
+
+            def secret_hash(user_email):
+                key = str(APP_CLIENT_SECRET).encode("utf-8")
+                message = str(user_email + APP_CLIENT_ID).encode("utf-8")
+                hash = base64.b64encode(
+                    hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+                return hash
+
+            def http_status_codes(code, response):
+                return {
+                    'statusCode': code,
+                    'response': response
+                }
+
+            def lambda_handler(event, context):
+                event = event["body"] if "body" in event and event["body"] is not None else event
+                for field in ["Confirmation Code", "Password"]:
+                    if not event.get(field):
+                        message = f"Kindly select {field}"
+                        return http_status_codes(400, message)
+
+                client = boto3.client('cognito-idp')
+                user_email = event['email']
+                confirmation_code = event['Confirmation Code']
+                password = event['Password']
+
+                try:
+                    response = client.confirm_forgot_password(
+                        ClientId=APP_CLIENT_ID,
+                        SecretHash=secret_hash(user_email),
+                        Username=user_email,
+                        ConfirmationCode=confirmation_code,
+                        Password=password,
+                    )
+                
+                except client.exceptions.ResourceNotFoundException as e:
+                    return http_status_codes(400, "Resource Not Found")
+                except client.exceptions.UnexpectedLambdaException as e:
+                    return http_status_codes(400, "Unexpected Lambda")
+                except client.exceptions.UserLambdaValidationException as e:
+                    return http_status_codes(400, "User Lambda Validation")
+                except client.exceptions.InvalidParameterException as e:
+                    return http_status_codes(400, "Invalid Parameter")
+                except client.exceptions.InvalidPasswordException as e:
+                    return http_status_codes(400, "Invalid Password")
+                except client.exceptions.NotAuthorizedException as e:
+                    return http_status_codes(400, "Not Authorized")
+                except client.exceptions.ExpiredCodeException as e:
+                    return http_status_codes(400, "ExpiredCode")
+                except client.exceptions.CodeMismatchException as e:
+                    return http_status_codes(400, "Code Mismatch")
+                except client.exceptions.ExpiredCodeException as e:
+                    return http_status_codes(400, "ExpiredCode")
+                except client.exceptions.TooManyFailedAttemptsException as e:
+                    return http_status_codes(400, "Too Many Failed Attempts")
+                except client.exceptions.InvalidLambdaResponseException as e:
+                    return http_status_codes(400, "Invalid Lambda Response")
+                except client.exceptions.TooManyRequestsException as e:
+                    return http_status_codes(400, "Too Many Requests")
+                except client.exceptions.LimitExceededException as e:
+                    return http_status_codes(400, "Exceeded")
+                except client.exceptions.UserNotFoundException as e:
+                    return http_status_codes(400, "User Not Found")
+                except client.exceptions.UserNotConfirmedException as e:
+                    return http_status_codes(400, "User Not Confirmed")
+                except client.exceptions.InternalErrorException as e:
+                    return http_status_codes(400, "Internal Error")
+                except client.exceptions.ForbiddenException as e:
+                    return http_status_codes(400, "Forbidden")
+      Environment:
+        Variables: 
+          POOL_ID: !Ref SavaUserPool
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+
+  # SAVA CHANGEPASSWORD
+  SavaChangePassword:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: SavaChangePassword 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+            import json
+            import boto3
+            import botocore
+            
+            def http_status_codes(code, response):
+            		return {
+            				'statusCode': code,
+            				'response': response
+            		}
+            
+            def lambda_handler(event, context):
+            		event = event["body"] if "body" in event and event["body"] is not None else event
+            		for field in ["Previous Password", "Confirm Password"]:
+            				if not event.get(field):
+            						response = f"Kindly select {field}"
+            						return http_status_codes(400, response)
+            		
+            		client = boto3.client('cognito-idp')
+            		previouspassword = event['Previous Password']
+            		confirmpassword = event['Confirm Password']
+            		accesstoken = event['Access Token']    
+            
+            		try:
+            				response = client.change_password(
+            						PreviousPassword=previouspassword,
+            						ProposedPassword=confirmpassword,
+            						AccessToken=accesstoken
+            				)
+            		
+            		except client.exceptions.ResourceNotFoundException as e:
+            				return http_status_codes(400, "Resource Not Found")
+            		except client.exceptions.InvalidParameterException as e:
+            				return http_status_codes(400, "Invalid Parameter")
+            		except client.exceptions.InvalidPasswordException as e:
+            				return http_status_codes(400, "Invalid Password")
+            		except client.exceptions.NotAuthorizedException as e:
+            				return http_status_codes(400, "Not Authorized")
+            		except client.exceptions.TooManyRequestsException as e:
+            				return http_status_codes(400, "Too Many Requests")
+            		except client.exceptions.LimitExceededException as e:
+            				return http_status_codes(400, "Limit Exceeded")
+            		except client.exceptions.PasswordResetRequiredException as e:
+            				return http_status_codes(400, "Password Reset Required")
+            		except client.exceptions.UserNotFoundException as e:
+            				return http_status_codes(400, "User Not Found")
+            		except client.exceptions.UserNotConfirmedException as e:
+            				return http_status_codes(400, "User Not Confirmed")
+            		except client.exceptions.InternalErrorException as e:
+            				return http_status_codes(400, "Internal Error")
+            		except client.exceptions.ForbiddenException as e:
+            				return http_status_codes(400, "Forbidden")
+      Environment:
+        Variables: 
+          POOL_ID: !Ref SavaUserPool
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+      
+  # SAVA RESENDCONFIRMATION CODE
+  SavaResendConfirmationCode:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: SavaResendConfirmationCode 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+            import json
+            import boto3
+            import botocore.exceptions
+            import os
+            import hmac
+            import hashlib
+            import base64
+            
+            POOL_ID = os.environ['POOL_ID']
+            APP_CLIENT_ID = os.environ['APP_CLIENT_ID']
+            APP_CLIENT_SECRET = os.environ['APP_CLIENT_SECRET']
+            
+            def secret_hash(user_email):
+                key = str(APP_CLIENT_SECRET).encode("utf-8")
+                message = str(user_email + APP_CLIENT_ID).encode("utf-8")
+                hash = base64.b64encode(
+                    hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+                return hash
+            
+            def lambda_handler(event, context):
+                client = boto3.client('cognito-idp')
+                user_email = event['email']
+            
+                try:
+                    response = client.resend_confirmation_code(
+                        ClientId=APP_CLIENT_ID,
+                        SecretHash=secret_hash(user_email),
+                        Username=user_email,
+                    )
+                
+                except client.exceptions.ResourceNotFoundException as e:
+                    return http_status_codes(400, "Resource Not Found")
+                except client.exceptions.InvalidParameterException as e:
+                    return http_status_codes(400, "Invalid Parameter")
+                except client.exceptions.UnexpectedLambdaException as e:
+                    return http_status_codes(400, "Unexpected Lambda")
+                except client.exceptions.UserLambdaValidationException as e:
+                    return http_status_codes(400, "User Lambda Validation")
+                except client.exceptions.NotAuthorizedException as e:
+                    return http_status_codes(400, "Not Authorized")
+                except client.exceptions.InvalidLambdaResponseException as e:
+                    return http_status_codes(400, "Invalid Lambda Response")
+                except client.exceptions.TooManyRequestsException as e:
+                    return http_status_codes(400, "Too Many Requests")
+                except client.exceptions.LimitExceededException as e:
+                    return http_status_codes(400, "Limit Exceeded")
+                except client.exceptions.InvalidSmsRoleAccessPolicyException as e:
+                    return http_status_codes(400, "Invalid Sms RoleAccess Policy")
+                except client.exceptions.InvalidSmsRoleTrustRelationshipException as e:
+                    return http_status_codes(400, "InvalidSmsRoleTrustRelationship")
+                except client.exceptions.InvalidEmailRoleAccessPolicyException as e:
+                    return http_status_codes(400, "InvalidEmailRoleAccessPolicy")
+                except client.exceptions.CodeDeliveryFailureException as e:
+                    return http_status_codes(400, "Code Delivery Failure")
+                except client.exceptions.UserNotFoundException as e:
+                    return http_status_codes(400, "User Not Found")
+                except client.exceptions.InternalErrorException as e:
+                    return http_status_codes(400, "Internal Error")
+                except client.exceptions.ForbiddenException as e:
+                    return http_status_codes(400, "Forbidden")
+      Environment:
+        Variables: 
+          POOL_ID: !Ref SavaUserPool
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+  # SAVA SIGNIN
+  SavaSignin:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt SavaRole.Arn
+      FunctionName: SavaSignin 
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+            import json
+            import boto3
+            import botocore.exceptions
+            import os
+            import hmac
+            import hashlib
+            import base64
+
+            APP_CLIENT_ID = os.environ['APP_CLIENT_ID']
+            APP_CLIENT_SECRET = os.environ['APP_CLIENT_SECRET']
+
+            def secret_hash(user_email):
+                key = str(APP_CLIENT_SECRET).encode("utf-8")
+                message = str(user_email + APP_CLIENT_ID).encode("utf-8")
+                hash = base64.b64encode(
+                    hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+                return hash
+
+
+            def http_status_codes(code, response):
+                return {
+                    'statusCode': code,
+                    'response': response
+                }
+
+
+            def lambda_handler(event, context):
+                event = event['body'] if "body" in event and event['body'] is not None else event
+                for field in ["email", "password"]:
+                    if not event.get(field):
+                        response = f"Kindly select {field}"
+                        return http_status_codes(400, response)
+
+
+                client = boto3.client('cognito-idp')
+                user_email = event['email']
+                password = event['password']
+
+                try:
+                    response = client.initiate_auth(
+                        ClientId=APP_CLIENT_ID,
+                        AuthFlow='USER_PASSWORD_AUTH',
+                        AuthParameters={
+                            'USERNAME': user_email,
+                            'SecretHash':secret_hash(user_email),
+                            'PASSWORD': password
+                        }
+                    )
+
+                    print(response)
+
+                except client.exceptions.ResourceNotFoundException as e:
+                    return http_status_codes(400, "Resource Not Found")
+                except client.exceptions.InvalidParameterException as e:
+                    return http_status_codes(400, "Invalid Parameter")
+                except client.exceptions.NotAuthorizedException as e:
+                    return http_status_codes(400, "Not Authorized")
+                except client.exceptions.TooManyRequestsException as e:
+                    return http_status_codes(400, "Too Many Requests")
+                except client.exceptions.UnexpectedLambdaException as e:
+                    return http_status_codes(400, "Unexpected Lambda")
+                except client.exceptions.InvalidUserPoolConfigurationException as e:
+                    return http_status_codes(400, "Invalid UserPool Configuration")
+                except client.exceptions.UserLambdaValidationException as e:
+                    return http_status_codes(400, "User Lambda Validation")
+                except client.exceptions.InvalidLambdaResponseException as e:
+                    return http_status_codes(400, "Invalid Lambda Response")
+                except client.exceptions.PasswordResetRequiredException as e:
+                    return http_status_codes(400, "Password Reset Required")
+                except client.exceptions.UserNotFoundException as e:
+                    return http_status_codes(400, "User Not Found")
+                except client.exceptions.UserNotConfirmedException as e:
+                    return http_status_codes(400, "User Not Confirmed")
+                except client.exceptions.InternalErrorException as e:
+                    return http_status_codes(400, "Internal Error")
+                except client.exceptions.InvalidSmsRoleAccessPolicyException as e:
+                    return http_status_codes(400, "Invalid Sms Role Access Policy")
+                except client.exceptions.InvalidSmsRoleTrustRelationshipException as e:
+                    return http_status_codes(400, "Invalid Sms Role Trust Relationship")
+                except client.exceptions.InvalidEmailRoleAccessPolicyException as e:
+                    return http_status_codes(400, "Invalid Email Role Access Policy")
+      Environment:
+        Variables: 
+          APP_CLIENT_ID: !Ref SavaUserPoolClient
+
+              
+  # LAMBDA USED FOR PROFILE PIC UPLOAD
+  SavaprofileUploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 500
+      Environment:
+        Variables:  
+          key: BUCKET_NAME
+          value: sava-users-bucket-mains
+      Handler: index.lambda_handler
+      FunctionName: Lambda_profilepics_lambda
+      Role: !GetAtt SavaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+
+          def lambda_handler(event, context):
+              s3 = boto3.client("s3")
+              
+              userid= event["queryStringParameters"]["user"]
+              content= userid+"/profile-pics/profile-pic.jpg"      
+              bucketname = "sava-users-bucket-mains" 
+              if event["routeKey"]=="POST /upload-profile-pic":
+                  get_file_content = event["body"]
+                  if event["isBase64Encoded"] == True:
+                      decode_content = base64.b64decode(get_file_content)
+                      s3_upload = s3.put_object(Bucket=bucketname, Key=content, Body=decode_content,ContentType='image/jpg')
+                    
+                  elif event["isBase64Encoded"] == False:                    
+                      s3_upload = s3.put_object(Bucket=bucketname, Key=content, Body=get_file_content,ContentType='image/jpg')       
+                  return ( {'staus':'file Successfully uploaded'})
+
+              if event["routeKey"]=="DELETE /upload-profile-pic":
+                  s3=boto3.resource('s3')
+                  s3.Object(bucketname, content).delete()
+                  return({'staus':"Picture has been successfully deleted"})
+          
+  # LAMBDA USED FOR PICTURE UPLOAD
+  SavapicsUploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 500
+      Environment:
+        Variables:  
+          key: BUCKET_NAME
+          value: sava-users-bucket-mains
+      Handler: index.lambda_handler
+      FunctionName: Lambda_picsupload_lambda
+      Role: !GetAtt SavaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          import string
+          import random
+          import os
+
+          def generate_string():
+              N = 8
+              return "".join(random.choices(string.ascii_lowercase +string.digits, k=N))
+
+          def lambda_handler(event, context):
+              s3 = boto3.client("s3")
+              userid= event["queryStringParameters"]["user"]
+              bucketname = "sava-users-bucket-mains"
+              
+              if event["routeKey"]=="POST /upload-pic":
+                  imageid = generate_string()
+                  content = userid+"/uploads/"+imageid+".jpg"
+                  get_file_content = event["body"]
+                  if event["isBase64Encoded"] == True:
+                      decode_content = base64.b64decode(get_file_content)
+                      s3_upload = s3.put_object(Bucket=bucketname, Key=content, Body=decode_content,ContentType='image/jpg')
+                    
+            
+                  
+                  elif event["isBase64Encoded"] == False:
+                      
+                      s3_upload = s3.put_object(Bucket=bucketname, Key=content, Body=get_file_content,ContentType='image/jpg')
+                  
+                  
+                  return ( {'staus':'file Successfully uploaded','file-name':imageid})
+
+  # LAMBDA USED FOR GETTING USER PICTURES
+  SavagetcategoriesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 500
+      Environment:
+        Variables:  
+          key: BUCKET_NAME
+          value: sava-users-bucket-mains
+      Handler: index.lambda_handler
+      FunctionName: sava_get_categories
+      Role: !GetAtt SavaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3 
+          import json 
+          import os
+
+          POOL_ID = os.environ['POOL_ID']
+
+          def lambda_handler(event, context): 
+              # print("queryStringParameters", event["queryStringParameters"])
+              user_id = event["queryStringParameters"]["user"]
+              client = boto3.client('cognito-idp')
+              s3 = boto3.resource("s3")
+              
+              categories = ["happy-moments", "profile-pics", "self-image", "you-and-friends", "you-and-pets", "uploads"]
+              happyMoments = []
+              profilePics = []
+              withFriends = []
+              selfImage = []
+              withPets = []
+              uploads = []
+              
+              
+              happyMomentsKey = f"{user_id}/{categories[0]}/"
+              profilePicsKey = f"{user_id}/{categories[1]}/"
+              selfImageKey = f"{user_id}/{categories[2]}/"
+              withFriendsKey = f"{user_id}/{categories[3]}/"
+              withPetsKey = f"{user_id}/{categories[4]}/"
+              uploadsKey = f"{user_id}/{categories[5]}/"
+              # print("happyMomentsKey", happyMomentsKey)
+              bucketName = "sava-users-bucket-mains"
+              bucket = s3.Bucket(bucketName)
+              
+              for obj in bucket.objects.all():
+                  if obj.key.find(happyMomentsKey) is not -1:
+                      happyMoments.append(obj.key)
+                  if obj.key.find(profilePicsKey) is not -1:
+                      profilePics.append(obj.key)
+                  if obj.key.find(selfImageKey) is not -1:
+                      selfImage.append(obj.key)
+                  if obj.key.find(withFriendsKey) is not -1:
+                      withFriends.append(obj.key)
+                  if obj.key.find(withPetsKey) is not -1:
+                      withPets.append(obj.key)
+                  if obj.key.find(uploadsKey) is not -1:
+                      uploads.append(obj.key)
+              
+              happyMoments = getObjectUrl(happyMoments, bucketName, s3)
+              selfImage = getObjectUrl(selfImage, bucketName, s3)
+              withFriends = getObjectUrl(withFriends, bucketName, s3)
+              withPets = getObjectUrl(withPets, bucketName, s3)
+              profilePics = getObjectUrl(profilePics, bucketName, s3)
+              uploads = getObjectUrl(uploads, bucketName, s3)
+              print("selfImage", selfImage)
+                  
+              return {
+                  "statusCode": 200,
+                  "isBase64Encoded": True,
+                  "headers": {
+                      "Content-Type": "application/json"
+                  },
+                  'headers': {
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                  },
+                  "body": json.dumps({
+                      
+                      "UserImages": {
+                          "SelfImage": selfImage,
+                          "HappyMoments": happyMoments,
+                          "WithPets": withPets,
+                          "WithFriends": withFriends,
+                          "ProfilePics": profilePics,
+                          "Uploads": uploads,
+                      }
+                  })
+              }
+
+          def getObjectUrl(arr, bucketName, s3):
+              if len(arr) > 1: 
+                  arr.pop(0)
+              else: 
+                  arr.pop()
+              categoriesPath = []
+              for key in arr: 
+                  url = s3.meta.client.generate_presigned_url('get_object',
+                  Params={
+                  'Bucket': bucketName,
+                  'Key': key   
+                  })
+                  print("url", url)
+                  categoriesPath.append(url)
+              return categoriesPath
+                  
+                        
+                          
+  # SAVA API GATEWAY
+  SAVASwaggerApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+
+      Name: SAVA API
+      Description: API used for sava app
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      FailOnWarnings: true
+      Body:
+        swagger: "2.0"
+        info:
+          version: "v1"
+          title: "sava_cognito"
+        host: "m2k5r0csf5.execute-api.us-east-1.amazonaws.com"
+        basePath: "/dev"
+        schemes:
+        - "https"
+        paths:
+          /categories:
+            get:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:sava_get_categories/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /initiate_auth/confirm_forgot_password:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:SavaConfirmForgotPassword/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /initiate_auth/forgotpassword:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:SavaForgotPassword/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /initiate_auth/sign_in:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:SavaSignin/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /initiate_auth/sign_out:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:SavaSignOut/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /new_user/confirm_sign_up:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:sava_confirm_signUp/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /new_user/resend_confirmation_code:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:SavaResendConfirmationCode/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /new_user/sign_up:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:savasignUp/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /update/change_password:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:SavaChangePassword/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /user/profile_image:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:Lambda_profilepics_lambda/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            delete:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:Lambda_profilepics_lambda/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'DELETE,OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+          /user/user_image:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:Lambda_picsupload_lambda/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            delete:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:736357471058:function:Lambda_picsupload_lambda/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'DELETE,OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+        definitions:
+          Empty:
+            type: "object"
+            title: "Empty Schema"
+        x-amazon-apigateway-gateway-responses:
+          DEFAULT_5XX:
+            responseParameters:
+              gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          DEFAULT_4XX:
+            responseParameters:
+              gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        x-amazon-apigateway-binary-media-types:
+        - "image/jpg"
+        - "image/jpeg"
+        - "application/octet-stream"

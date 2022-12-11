@@ -1,0 +1,323 @@
+Parameters:
+  BridgeRuleName:
+    Type: String 
+    Default: SecondTrigger
+  LambdaPolicyName:
+    Type: String 
+    Default: LambdaPictureRoles
+
+Resources:
+  ProfileLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties: {}
+          
+  SortLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties: {}
+
+  ProfilePictureRoles: 
+    Type: AWS::IAM::Role 
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyDocument:
+            Statement: 
+              -
+                Effect: "Allow"
+                Action: "logs:CreateLogGroup"
+                # Resource: "arn:aws:logs:us-east-1:736357471058:*"
+                # Resource: "*"
+                Resource: !Join [":", ["arn:aws:logs", !Ref AWS::Region, !Ref AWS::AccountId, "*"]]
+              -
+                Effect: "Allow"
+                Action: 
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  # - "arn:aws:logs:us-east-1:736357471058:log-group:/aws/lambda/sava-picture-sort:*"
+                  # - "*"
+                  - !Join [":", ["arn:aws:logs", !Ref AWS::Region, !Ref AWS::AccountId, !Ref ProfileLogGroup]]
+              -
+                Effect: "Allow"
+                Action: 
+                  - "s3:*"
+                  - "s3-object-lambda:*"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "rekognition:*"
+                Resource: "*"
+          PolicyName: !Ref LambdaPolicyName
+
+  UploadPictureRoles: 
+    Type: AWS::IAM::Role 
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyDocument:
+            Statement: 
+              -
+                Effect: "Allow"
+                Action: "logs:CreateLogGroup"
+                # Resource: "arn:aws:logs:us-east-1:736357471058:*"
+                # Resource: "*"
+                Resource: !Join [":", ["arn:aws:logs", !Ref AWS::Region, !Ref AWS::AccountId, "*"]]
+              -
+                Effect: "Allow"
+                Action: 
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  # - "arn:aws:logs:us-east-1:736357471058:log-group:/aws/lambda/sava-picture-sort:*"
+                  # - "*"
+                  - !Join [":", ["arn:aws:logs", !Ref AWS::Region, !Ref AWS::AccountId, !Ref SortLogGroup]]
+              -
+                Effect: "Allow"
+                Action: 
+                  - "s3:*"
+                  - "s3-object-lambda:*"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "rekognition:*"
+                Resource: "*"
+          PolicyName: !Ref LambdaPolicyName
+
+  UserDetailsBucket: 
+    Type: AWS::S3::Bucket 
+    Properties:
+      BucketName: sava-users-bucket-main
+
+  UserProfilePicsBucket: 
+    Type: AWS::S3::Bucket 
+    Properties:
+      BucketName: sava-profile-pictures
+
+  ProfilePixAnalyzer: 
+    Type: AWS::Lambda::Function 
+    Properties:
+      FunctionName: profile-pix-analyzer
+      Role: !GetAtt ProfilePictureRoles.Arn
+      Runtime: python3.7
+      Handler: index.handler
+      Code:
+        ZipFile: | 
+          import boto3
+          import json
+
+          print('Loading function')
+          s3 = boto3.client('s3')
+          resource_s3 = boto3.resource("s3")
+          # profilePictureBucket = boto3.client('s3')
+          rekognition = boto3.client('rekognition')
+
+          def same_picture(source, target):
+            response = rekognition.compare_faces(SourceImage=source, TargetImage=target)
+            print("response", response)
+            
+            if len(response["FaceMatches"]) != 1:
+              return False
+            similarity_score = response["FaceMatches"][0]["Similarity"]
+            if similarity_score > 80:
+              return True
+              
+            return False
+
+          def lambda_handler(event, context):
+
+            print("event", event)
+            bucket = event["detail"]['bucket']["name"]
+            print("savausersbucketmain:", bucket)
+            key = event["detail"]['object']['key']
+            print("Key:", key)
+            keyFolders = key.split("/")
+            print("keyFolders", keyFolders)
+            
+            if keyFolders[1] != "profile-pics": 
+                print("Not profile pics")
+                return "Not profile"
+            
+            image= {
+              "S3Object": {
+                "Bucket": bucket,
+                "Name": key
+              }
+            }
+            print("image", image)
+            object = s3.get_object(Bucket=bucket,Key=key)
+            print("object", object)
+            
+            response = rekognition.detect_faces(Image=image)
+            faces = response["FaceDetails"]
+            if len(faces) is not 1:
+              print("more than one face")
+              return "Invalid Picture"
+            
+            profile_pics_bucket = resource_s3.Bucket('sava-profile-pictures')
+            print("profile_pics_bucket", profile_pics_bucket)
+            # profile_pics = resource_s3.list_objects_v2(Bucket="sava-profile-pictures")
+            # print("profile-pics", profile_pics)
+            for picture in profile_pics_bucket.objects.all():
+              print("picture key", picture.key)
+              source_image = {
+                "S3Object": {
+                  "Bucket": "sava-profile-pictures",
+                  "Name": picture.key
+                }
+              }
+              
+              picture_already_present = same_picture(source_image, image)
+              print("picture_already_present", picture_already_present)
+              if picture_already_present is True:
+                return "Invalid Picture"
+              
+            copy_source = {'Bucket': bucket, 'Key': key}
+            picture_new_key = keyFolders[0] + ".jpg"
+
+            s3.copy_object(Bucket = "sava-profile-pictures", CopySource = copy_source, Key = picture_new_key)
+
+  SortUploads: 
+    Type: AWS::Lambda::Function 
+    Properties:
+      FunctionName: sava-picture-sort
+      Role: !GetAtt UploadPictureRoles.Arn
+      Runtime: python3.7
+      Handler: index.handler
+      Code:
+        ZipFile: | 
+          import boto3
+          import json
+
+          print('Loading function')
+          s3 = boto3.client('s3')
+          resource_s3 = boto3.resource("s3")
+          # profilePictureBucket = boto3.client('s3')
+          rekognition = boto3.client('rekognition')
+
+          def user_in_picture(source, target):
+            response = rekognition.compare_faces(SourceImage=source, TargetImage=target)
+            print("response", response)
+            
+            for face in response["FaceMatches"]: 
+              similarity_score = face["Similarity"]
+              if similarity_score >= 80: 
+                return True
+            
+            return False
+
+          def handle_user_only(image, bucket, key, keyFolders):
+            response = rekognition.detect_faces(Image=image)
+            faces = response["FaceDetails"]
+            if len(faces) == 1:
+                copy_source = {'Bucket': bucket, 'Key': key}
+                picture_new_key = keyFolders[0] + "/self-image/" + keyFolders[2]
+
+                s3.copy_object(Bucket = bucket, CopySource = copy_source, Key = picture_new_key)
+
+          def handle_user_and_friends(image, bucket, key, keyFolders):
+            response = rekognition.detect_faces(Image=image)
+            faces = response["FaceDetails"]
+            if len(faces) > 1:
+                copy_source = {'Bucket': bucket, 'Key': key}
+                picture_new_key = keyFolders[0] + "/you-and-friends/" + keyFolders[2]
+
+                s3.copy_object(Bucket = bucket, CopySource = copy_source, Key = picture_new_key)
+                
+          def handle_user_and_pet(image, bucket, key, keyFolders):
+            response = rekognition.detect_labels(Image=image)
+            for label in response["Labels"]:
+              if label["Name"] == "Animal":
+                copy_source = {'Bucket': bucket, 'Key': key}
+                picture_new_key = keyFolders[0] + "/you-and-pets/" + keyFolders[2]
+                s3.copy_object(Bucket = bucket, CopySource = copy_source, Key = picture_new_key)
+                return
+            
+                
+          def lambda_handler(event, context):
+            print("event", event)
+            bucket = event["detail"]['bucket']["name"]
+            print("savausersbucketmain:", bucket)
+            key = event["detail"]['object']['key']
+            print("Key:", key)
+            keyFolders = key.split("/")
+            print("keyFolders", keyFolders)
+            
+            if keyFolders[1] != "uploads": 
+                print("Not profile pics")
+                return "Not profile"
+            
+            image= {
+              "S3Object": {
+                "Bucket": bucket,
+                "Name": key
+              }
+            }
+            print("image", image)
+            object = s3.get_object(Bucket=bucket,Key=key)
+            print("object", object)
+            
+            response = rekognition.detect_faces(Image=image)
+            faces = response["FaceDetails"]
+            print("faces", faces)
+            if len(faces) < 1:
+              print("No face detected")
+              # return "Invalid Picture"
+              
+            # user_profile_pix = s3.get_object(Bucket="sava-profile-pictures", Key=key+".jpg")
+            user_profile_pix= {
+              "S3Object": {
+                "Bucket": "sava-profile-pictures",
+                "Name": keyFolders[0] + ".jpg"
+              }
+            }
+            print("user_profile_pix", user_profile_pix)
+            
+            user_in_upload = user_in_picture(user_profile_pix, image)
+            print("user in ", user_in_upload)
+            if user_in_upload is False: 
+              return 
+            
+            handle_user_only(image, bucket, key, keyFolders)
+            handle_user_and_friends(image, bucket, key, keyFolders)
+            handle_user_and_pet(image, bucket, key, keyFolders)
+
+  SavaBridge:
+    Type: AWS::Events::Rule 
+    Properties:
+      Name: !Ref  BridgeRuleName
+      EventPattern:
+        source: 
+          - aws.s3
+        detail-type: 
+          - Object Created
+        detail: 
+          bucket: 
+            name:       
+              - sava-users-bucket-main
+      Targets:
+        - Arn: !GetAtt ProfilePixAnalyzer.Arn
+          Id: profile-pix
+        - Arn: !GetAtt SortUploads.Arn
+          Id: other-pix
+          
+        
